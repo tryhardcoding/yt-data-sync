@@ -1,0 +1,7 @@
+{
+  "name": "yt-data-sync",
+  "private": true,
+  "type": "module",
+  "scripts": { "sync": "node sync.mjs" },
+  "dependencies": { "@supabase/supabase-js": "^2.45.0" }
+}
