@@ -63,8 +63,10 @@ async function processItem(itemId) {
   const first = html.match(
     /"liveChatRenderer":\{"continuations":\[\{"reloadContinuationData":\{"continuation":"([^"]+)"/,
   );
-  // チャット無効・メンバー限定・リプレイ無しは恒久的。0で確定記録し二度と再取得しない
-  // （毎日リトライで無駄なリクエストが累積するのを防ぐ）。
+  // key/first が無い＝チャット無効・メンバー限定・リプレイ未生成のいずれか。
+  // 恒久的（チャット無効等）なら0確定でよいが、配信直後はリプレイ生成ラグで
+  // 一時的にこうなることがある。0を恒久記録すると取りこぼすので、確定は main 側で
+  // 公開からの経過時間を見て判断する（empty を返すだけ）。
   if (!key || !first) return { empty: true };
   let continuation = first[1];
 
@@ -73,6 +75,9 @@ async function processItem(itemId) {
   let memberJoins = 0;
   let giftMemberships = 0;
   let pages = 0;
+  // ページループが「自然終了（次のcontinuationが無い）」で終わったかを追跡する。
+  // 429等で途中中断すると部分集計になるので、その場合はretryで返して確定させない。
+  let interrupted = false;
   for (let i = 0; i < MAX_PAGES && continuation; i++) {
     const res = await fetch(
       `https://www.youtube.com/youtubei/v1/live_chat/get_live_chat_replay?key=${key}&prettyPrint=false`,
@@ -82,10 +87,16 @@ async function processItem(itemId) {
         body: JSON.stringify({ context: { client: CLIENT }, continuation }),
       },
     );
-    if (!res.ok) break;
+    if (!res.ok) {
+      interrupted = true; // 429/5xx等の一過性失敗。部分集計を確定させない
+      break;
+    }
     const data = await res.json();
     const cont = data.continuationContents?.liveChatContinuation;
-    if (!cont) break;
+    if (!cont) {
+      interrupted = true; // 応答異常。同上
+      break;
+    }
     pages++;
     for (const a of cont.actions ?? []) {
       const item =
@@ -125,6 +136,9 @@ async function processItem(itemId) {
       null;
     await new Promise((r) => setTimeout(r, PAGE_PAUSE_MS));
   }
+
+  // 途中中断（429等）は部分集計なので確定させず翌日リトライに回す。
+  if (interrupted) return null;
 
   let total = 0;
   for (const [unit, amt] of Object.entries(breakdown)) {
@@ -212,35 +226,50 @@ async function main() {
     );
   }
 
+  // リプレイ生成ラグの猶予: 公開からこの時間を過ぎてもチャットが無ければ恒久的とみなす。
+  const EMPTY_CONFIRM_MS = 48 * 3600_000;
+
   let written = 0;
   let empties = 0;
   let truncated = 0;
+  let deferred = 0;
   const t0 = Date.now();
   const budgetMs = 300 * 60_000; // 実行時間の安全上限（次回に持ち越す）
   await mapPool(targets, 8, async (row) => {
     if (Date.now() - t0 > budgetMs) return;
     const result = await processItem(row.video_id);
-    if (!result) return; // 一過性失敗。翌日リトライ（行を書かない）
+    if (!result) return; // 一過性失敗・途中中断。翌日リトライ（行を書かない）
+    if (result.empty) {
+      // 公開が新しい配信はリプレイ未生成の可能性があるので0確定を保留（翌日リトライ）。
+      // published_atが不明（backfillターゲット）なら確定してよい。
+      const pubMs = row.published_at ? Date.parse(row.published_at) : 0;
+      if (pubMs && Date.now() - pubMs < EMPTY_CONFIRM_MS) {
+        deferred++;
+        return;
+      }
+      empties++;
+    }
     if (result.truncated) truncated++;
-    if (result.empty) empties++;
     // emptyは0で確定記録し、already入りさせて恒久リトライを止める
-    const { error: upErr } = await db.from("video_superchats").upsert(
-      {
-        video_id: row.video_id,
-        channel_id: row.channel_id,
-        total_yen: result.empty ? 0 : result.total,
-        superchat_count: result.empty ? 0 : result.count,
-        currency_breakdown: result.empty ? {} : result.breakdown,
-        member_joins: result.empty ? 0 : result.memberJoins,
-        gift_memberships: result.empty ? 0 : result.giftMemberships,
-        harvested_at: new Date().toISOString(),
-      },
-      { onConflict: "video_id" },
-    );
+    const patch = {
+      video_id: row.video_id,
+      channel_id: row.channel_id,
+      total_yen: result.empty ? 0 : result.total,
+      superchat_count: result.empty ? 0 : result.count,
+      currency_breakdown: result.empty ? {} : result.breakdown,
+      member_joins: result.empty ? 0 : result.memberJoins,
+      gift_memberships: result.empty ? 0 : result.giftMemberships,
+      harvested_at: new Date().toISOString(),
+    };
+    // published_atは持っている時だけ書く（member-backfillはnullなので既存値を壊さない）
+    if (row.published_at) patch.published_at = row.published_at;
+    const { error: upErr } = await db
+      .from("video_superchats")
+      .upsert(patch, { onConflict: "video_id" });
     if (!upErr) written++;
   });
   console.log(
-    `wrote ${written} (empty ${empties}, truncated ${truncated}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
+    `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
 }
 
