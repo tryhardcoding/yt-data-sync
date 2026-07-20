@@ -51,23 +51,55 @@ const CLIENT = { clientName: "WEB", clientVersion: "2.20250701.01.00", hl: "ja" 
 // 高価値配信を過小集計しないよう長め（~30時間相当）にする。到達時はtruncatedで記録。
 const MAX_PAGES = 1500;
 const PAGE_PAUSE_MS = 120;
+// 429/5xx/ネットワーク失敗のリトライ回数と初期バックオフ。YouTubeはデータセンター
+// （GitHub Actions）IPからのチャット取得を強く絞るため、握り潰さず指数バックオフで粘る。
+const FETCH_RETRIES = Number(process.env.SYNC_FETCH_RETRIES ?? 4);
+const FETCH_BACKOFF_MS = Number(process.env.SYNC_FETCH_BACKOFF_MS ?? 800);
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 429/5xx/ネットワーク失敗を指数バックオフ+ジッタで再試行する。恒久エラー（404等）や
+// リトライ尽きはそのままresを返し（nullもあり得る）、呼び出し側で一過性扱いを判断する。
+async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
+  let delay = FETCH_BACKOFF_MS;
+  for (let i = 0; i < tries; i++) {
+    let res = null;
+    try {
+      res = await fetch(url, opts);
+    } catch {
+      res = null;
+    }
+    if (res && res.ok) return res;
+    const status = res ? res.status : 0;
+    const retryable = status === 429 || status >= 500 || status === 0;
+    if (i < tries - 1 && retryable) {
+      await sleep(delay + Math.floor(Math.random() * 400));
+      delay *= 2;
+      continue;
+    }
+    return res;
+  }
+  return null;
+}
 
 async function processItem(itemId) {
-  const page = await fetch(`https://www.youtube.com/watch?v=${itemId}`, {
+  const page = await fetchRetry(`https://www.youtube.com/watch?v=${itemId}`, {
     headers: { "user-agent": UA, "accept-language": "ja" },
   });
   // ページ取得の一過性失敗は翌日リトライ（null）。
-  if (!page.ok) return null;
+  if (!page || !page.ok) return null;
   const html = await page.text();
   const key = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
   const first = html.match(
     /"liveChatRenderer":\{"continuations":\[\{"reloadContinuationData":\{"continuation":"([^"]+)"/,
   );
-  // key/first が無い＝チャット無効・メンバー限定・リプレイ未生成のいずれか。
-  // 恒久的（チャット無効等）なら0確定でよいが、配信直後はリプレイ生成ラグで
-  // 一時的にこうなることがある。0を恒久記録すると取りこぼすので、確定は main 側で
-  // 公開からの経過時間を見て判断する（empty を返すだけ）。
-  if (!key || !first) return { empty: true };
+  // INNERTUBE_API_KEY は正常なwatchページには必ず入っている。無い＝同意/ボット判定の
+  // 壁ページを掴まされた可能性が高いので、0確定せず一過性扱い（null）で翌日リトライに回す
+  // （データセンターIPでこれを0確定すると、実際にはスパチャのある配信を取りこぼす）。
+  if (!key) return null;
+  // key はあるがチャット継続が無い＝チャット無効・メンバー限定・リプレイ未生成。
+  // 配信直後の生成ラグで一時的にこうなるので、0の確定は main 側で公開経過を見て判断する。
+  if (!first) return { empty: true };
   let continuation = first[1];
 
   const breakdown = {};
@@ -79,7 +111,7 @@ async function processItem(itemId) {
   // 429等で途中中断すると部分集計になるので、その場合はretryで返して確定させない。
   let interrupted = false;
   for (let i = 0; i < MAX_PAGES && continuation; i++) {
-    const res = await fetch(
+    const res = await fetchRetry(
       `https://www.youtube.com/youtubei/v1/live_chat/get_live_chat_replay?key=${key}&prettyPrint=false`,
       {
         method: "POST",
@@ -87,8 +119,8 @@ async function processItem(itemId) {
         body: JSON.stringify({ context: { client: CLIENT }, continuation }),
       },
     );
-    if (!res.ok) {
-      interrupted = true; // 429/5xx等の一過性失敗。部分集計を確定させない
+    if (!res || !res.ok) {
+      interrupted = true; // バックオフ再試行後も失敗。部分集計を確定させない
       break;
     }
     const data = await res.json();
@@ -191,11 +223,11 @@ async function main() {
     targets = need;
     console.log(`member backfill targets: ${targets.length}`);
   } else {
-    // 対象の全アーカイブ（窓内）を1000行上限を跨いで全件取得。
+    // 対象の全アーカイブ（窓内）を1000行上限を跨いで全件取得（上限なし）。
     // スパチャは同接の多い配信にほぼ限られるため peak_concurrent降順で優先処理する
-    // （窓内は約3.5万本と多く、価値ある配信のカバーを前倒しするため）。
+    // （価値ある配信のカバーを前倒しし、末尾の0円配信は後回しでも埋まる）。
     const rows = [];
-    for (let from = 0; from < 40000; from += 1000) {
+    for (let from = 0; ; from += 1000) {
       const { data, error } = await db
         .from("tracked_videos")
         .select("video_id, channel_id, published_at, peak_concurrent")
@@ -235,7 +267,10 @@ async function main() {
   let deferred = 0;
   const t0 = Date.now();
   const budgetMs = 300 * 60_000; // 実行時間の安全上限（次回に持ち越す）
-  await mapPool(targets, 8, async (row) => {
+  // 並列数。データセンターIPでは高並列がYouTubeの絞りを誘発し成功率を落とすため、
+  // バックオフと併せて控えめ（既定4）にして純増を最大化する。SYNC_CONCURRENCYで調整可。
+  const concurrency = Math.max(1, Number(process.env.SYNC_CONCURRENCY ?? 4));
+  await mapPool(targets, concurrency, async (row) => {
     if (Date.now() - t0 > budgetMs) return;
     const result = await processItem(row.video_id);
     if (!result) return; // 一過性失敗・途中中断。翌日リトライ（行を書かない）
