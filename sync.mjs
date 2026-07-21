@@ -46,6 +46,24 @@ function parseAmount(text) {
   return { unit, amount };
 }
 
+// 発言者バッジからメンバー歴（月）を返す。メンバーでなければ null。
+// メンバーバッジは customThumbnail を持つ（MOD/OWNER/VERIFIED は icon.iconType）。
+// tooltip 例(hl=ja): "新規メンバー" / "メンバー（2 か月）" / "メンバー（3 年）" / "メンバー（2 年 1 か月）"。
+// 「年」は×12して月換算する（月だけ拾うと 3年→3か月 と誤るため。実データで確認済み）。
+function memberTenure(badges) {
+  if (!Array.isArray(badges)) return null;
+  for (const b of badges) {
+    const r = b.liveChatAuthorBadgeRenderer;
+    if (!r || !r.customThumbnail) continue;
+    const tip = r.tooltip || "";
+    if (/新規|new member/i.test(tip)) return 0;
+    const y = tip.match(/(\d+)\s*(?:年|years?)/);
+    const mo = tip.match(/(\d+)\s*(?:か月|ヶ月|months?)/);
+    return (y ? Number(y[1]) * 12 : 0) + (mo ? Number(mo[1]) : 0);
+  }
+  return null;
+}
+
 const CLIENT = { clientName: "WEB", clientVersion: "2.20250701.01.00", hl: "ja" };
 // 1配信のページ上限。同接の多い配信ほどチャットが長くページ数も多いので、
 // 高価値配信を過小集計しないよう長め（~30時間相当）にする。到達時はtruncatedで記録。
@@ -106,6 +124,8 @@ async function processItem(itemId) {
   let count = 0;
   let memberJoins = 0;
   let giftMemberships = 0;
+  // メンバーバッジ付きで発言したユニークaccount → 歴(月, 最大)。配信内で重複排除。
+  const members = new Map();
   let pages = 0;
   // ページループが「自然終了（次のcontinuationが無い）」で終わったかを追跡する。
   // 429等で途中中断すると部分集計になるので、その場合はretryで返して確定させない。
@@ -134,6 +154,19 @@ async function processItem(itemId) {
       const item =
         a.replayChatItemAction?.actions?.[0]?.addChatItemAction?.item;
       if (!item) continue;
+      // メンバー観測: 通常/スパチャ/ステッカーの発言者バッジからメンバー歴を拾う。
+      // コメントしたメンバーを1人ずつ確認できる（実測の下限。ROMメンバーは拾えない）。
+      const msg =
+        item.liveChatTextMessageRenderer ||
+        item.liveChatPaidMessageRenderer ||
+        item.liveChatPaidStickerRenderer;
+      if (msg) {
+        const aid = msg.authorExternalChannelId;
+        const tenure = memberTenure(msg.authorBadges);
+        if (aid && tenure !== null) {
+          members.set(aid, Math.max(members.get(aid) ?? 0, tenure));
+        }
+      }
       const paid =
         item.liveChatPaidMessageRenderer || item.liveChatPaidStickerRenderer;
       if (paid) {
@@ -182,6 +215,7 @@ async function processItem(itemId) {
     breakdown,
     memberJoins,
     giftMemberships,
+    members: [...members.entries()], // [accountId, 歴(月)][]
     pages,
     truncated: pages >= MAX_PAGES, // 上限到達＝集計が途中で切れている可能性
   };
@@ -265,6 +299,7 @@ async function main() {
   let empties = 0;
   let truncated = 0;
   let deferred = 0;
+  let membersWritten = 0;
   const t0 = Date.now();
   const budgetMs = 300 * 60_000; // 実行時間の安全上限（次回に持ち越す）
   // 並列数。データセンターIPでは高並列がYouTubeの絞りを誘発し成功率を落とすため、
@@ -302,9 +337,25 @@ async function main() {
       .from("video_superchats")
       .upsert(patch, { onConflict: "video_id" });
     if (!upErr) written++;
+
+    // 観測メンバーを channel_members へ記録（歴・観測日時はGREATESTで更新）。
+    // last_seen_at には配信の公開日時を渡す（30日窓＝直近30日の配信で観測、の意味）。
+    // published_atが無い（member-backfill）ときは窓の意味が壊れるのでスキップする。
+    if (!result.empty && result.members.length > 0 && row.published_at) {
+      const rows = result.members.map(([m, t]) => ({
+        c: row.channel_id,
+        m,
+        t,
+        s: row.published_at,
+      }));
+      const { error: mErr } = await db.rpc("record_channel_members", {
+        p_rows: rows,
+      });
+      if (!mErr) membersWritten += rows.length;
+    }
   });
   console.log(
-    `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
+    `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}, members ${membersWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
 }
 
