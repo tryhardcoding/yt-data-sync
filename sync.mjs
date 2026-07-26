@@ -126,6 +126,9 @@ async function processItem(itemId) {
   let giftMemberships = 0;
   // メンバーバッジ付きで発言したユニークaccount → 歴(月, 最大)。配信内で重複排除。
   const members = new Map();
+  // ギフトメンバーシップを受け取ったaccount。その月ぶんは贈り主が払っているので、
+  // 収益推定では観測メンバーから除外する（membershipYenとgiftYenの二重計上を止める）。
+  const giftRecipients = new Set();
   let pages = 0;
   // ページループが「自然終了（次のcontinuationが無い）」で終わったかを追跡する。
   // 429等で途中中断すると部分集計になるので、その場合はretryで返して確定させない。
@@ -186,14 +189,22 @@ async function processItem(itemId) {
         if (!header || !/month|か月|ヶ月/i.test(header)) memberJoins++;
         continue;
       }
-      // ギフトメンバーシップ購入告知（「Nギフト」の件数を合算）
+      // ギフトメンバーシップ購入告知（「ギフトを N 個贈りました」の口数を合算）。
+      // 文面はチャンネル名で始まるので、先頭の数字を拾うと名前の数字を口数と誤る
+      // （"【876プロ】... ギフトを 1 個贈りました" が876口になっていた）。「個」直前を取る。
       const gift = item.liveChatSponsorshipsGiftPurchaseAnnouncementRenderer;
       if (gift) {
         const text = gift.header?.liveChatSponsorshipsHeaderRenderer?.primaryText?.runs
           ?.map((r) => r.text)
           .join("");
-        const n = text?.match(/(\d+)/);
-        giftMemberships += n ? Number(n[1]) : 1;
+        const n = text?.match(/([\d,]+)\s*(?:個|gift)/i);
+        giftMemberships += n ? Number(n[1].replace(/,/g, "")) : 1;
+        continue;
+      }
+      // ギフト受贈告知。この renderer の author が受贈者本人。
+      const redeem = item.liveChatSponsorshipsGiftRedemptionAnnouncementRenderer;
+      if (redeem?.authorExternalChannelId) {
+        giftRecipients.add(redeem.authorExternalChannelId);
       }
     }
     continuation =
@@ -216,6 +227,7 @@ async function processItem(itemId) {
     memberJoins,
     giftMemberships,
     members: [...members.entries()], // [accountId, 歴(月)][]
+    giftRecipients: [...giftRecipients], // accountId[]
     pages,
     truncated: pages >= MAX_PAGES, // 上限到達＝集計が途中で切れている可能性
   };
@@ -256,6 +268,25 @@ async function main() {
     }
     targets = need;
     console.log(`member backfill targets: ${targets.length}`);
+  } else if (process.env.GIFT_BACKFILL === "1") {
+    // GIFT_BACKFILL=1: ギフトのあった窓内の配信だけ再処理する。目的は2つ。
+    //  1) 受贈者(redemption)は今回から拾うので、既存行には受贈者が1人も入っていない
+    //  2) 旧集計はチャンネル名の数字を口数と誤っていた（"【876プロ】...1個" が876口）
+    // published_at を持ったまま渡すので、channel_members の30日窓の意味は保たれる。
+    const need = [];
+    for (let from = 0; ; from += 1000) {
+      const { data } = await db
+        .from("video_superchats")
+        .select("video_id, channel_id, published_at")
+        .gt("gift_memberships", 0)
+        .gte("published_at", since)
+        .order("gift_memberships", { ascending: false })
+        .range(from, from + 999);
+      need.push(...(data ?? []));
+      if (!data || data.length < 1000) break;
+    }
+    targets = need;
+    console.log(`gift backfill targets: ${targets.length}`);
   } else {
     // 対象の全アーカイブ（窓内）を1000行上限を跨いで全件取得（上限なし）。
     // スパチャは同接の多い配信にほぼ限られるため peak_concurrent降順で優先処理する
@@ -300,6 +331,7 @@ async function main() {
   let truncated = 0;
   let deferred = 0;
   let membersWritten = 0;
+  let giftsWritten = 0;
   const t0 = Date.now();
   const budgetMs = 300 * 60_000; // 実行時間の安全上限（次回に持ち越す）
   // 並列数。データセンターIPでは高並列がYouTubeの絞りを誘発し成功率を落とすため、
@@ -353,9 +385,23 @@ async function main() {
       });
       if (!mErr) membersWritten += rows.length;
     }
+
+    // ギフト受贈者を記録する（収益推定で観測メンバーから外すため）。
+    // members と同じく published_at を窓の基準に使うので、無いときはスキップ。
+    if (!result.empty && result.giftRecipients.length > 0 && row.published_at) {
+      const rows = result.giftRecipients.map((m) => ({
+        c: row.channel_id,
+        m,
+        s: row.published_at,
+      }));
+      const { error: gErr } = await db.rpc("record_gift_recipients", {
+        p_rows: rows,
+      });
+      if (!gErr) giftsWritten += rows.length;
+    }
   });
   console.log(
-    `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}, members ${membersWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
+    `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}, members ${membersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
 }
 
