@@ -8,6 +8,14 @@ on:
       window_days:
         description: "window in days"
         default: "30"
+      mode:
+        description: "normal=未集計の配信を消化 / gift=窓内のギフト有り配信を再処理 / member=会員データ欠損行を再処理"
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - gift
+          - member
 
 concurrency:
   group: sync
@@ -28,3 +36,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SYNC_WINDOW_DAYS: ${{ github.event.inputs.window_days || '30' }}
+          GIFT_BACKFILL: ${{ github.event.inputs.mode == 'gift' && '1' || '0' }}
+          MEMBER_BACKFILL: ${{ github.event.inputs.mode == 'member' && '1' || '0' }}
