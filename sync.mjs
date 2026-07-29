@@ -73,6 +73,12 @@ const PAGE_PAUSE_MS = 120;
 // （GitHub Actions）IPからのチャット取得を強く絞るため、握り潰さず指数バックオフで粘る。
 const FETCH_RETRIES = Number(process.env.SYNC_FETCH_RETRIES ?? 4);
 const FETCH_BACKOFF_MS = Number(process.env.SYNC_FETCH_BACKOFF_MS ?? 800);
+// チャットのページ送りだけは粘りを強くする。ここで諦めると、それまでに歩いた
+// 数百ページが丸ごと無駄になる（実測: 同接13万の配信が740ページ目の503で落ち、
+// 181秒とメンバー2,000人規模の観測を捨てていた）。待つコストの方が桁で安い。
+const CHAT_RETRIES = Number(process.env.SYNC_CHAT_RETRIES ?? 8);
+// 指数バックオフの上限。8回×青天井だと1ページで数分待ちうる。
+const BACKOFF_CAP_MS = 20_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -90,6 +96,7 @@ const stats = {
   giveNet: 0,
   giveOther: 0,
   thrown: 0, // 予期しない例外
+  salvagedMembers: 0, // 中断した配信から救出したメンバー観測の数
 };
 
 // 429/5xx/ネットワーク失敗を指数バックオフ+ジッタで再試行する。恒久エラー（404等）や
@@ -109,7 +116,7 @@ async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
     if (i < tries - 1 && retryable) {
       stats.retries++;
       await sleep(delay + Math.floor(Math.random() * 400));
-      delay *= 2;
+      delay = Math.min(delay * 2, BACKOFF_CAP_MS);
       continue;
     }
     if (status === 429) stats.give429++;
@@ -168,6 +175,7 @@ async function processItem(itemId) {
         headers: { "content-type": "application/json", "user-agent": UA },
         body: JSON.stringify({ context: { client: CLIENT }, continuation }),
       },
+      CHAT_RETRIES,
     );
     if (!res || !res.ok) {
       interrupted = true; // バックオフ再試行後も失敗。部分集計を確定させない
@@ -240,10 +248,15 @@ async function processItem(itemId) {
     await new Promise((r) => setTimeout(r, PAGE_PAUSE_MS));
   }
 
-  // 途中中断（429等）は部分集計なので確定させず翌日リトライに回す。
+  // 途中中断（429等）は部分集計。金額・口数は過小になるので確定させず次回に回すが、
+  // 観測したメンバーだけは救出する。channel_members は「コメントしたメンバー」の
+  // 積み上げ＝実測の下限として持っており、途中まででも下限としては正しい。
+  // 長い配信ほど途中で落ちやすく、かつメンバー観測の価値が最も高いので、
+  // ここを捨てると一番欲しいデータだけが構造的に落ち続ける。
   if (interrupted) {
     stats.interrupted++;
-    return null;
+    stats.salvagedMembers += members.size;
+    return { partial: true, members: [...members.entries()], pages };
   }
 
   let total = 0;
@@ -377,15 +390,38 @@ async function main() {
   let membersWritten = 0;
   let giftsWritten = 0;
   const t0 = Date.now();
-  const budgetMs = 300 * 60_000; // 実行時間の安全上限（次回に持ち越す）
+  // 実行時間の安全上限（超えたぶんは次回に持ち越す）。手元で短く回して
+  // 動作を確かめられるよう env で上書きできる。
+  const budgetMs = Number(process.env.SYNC_BUDGET_MIN ?? 300) * 60_000;
   // 並列数。データセンターIPでは高並列がYouTubeの絞りを誘発し成功率を落とすため、
   // バックオフと併せて控えめ（既定4）にして純増を最大化する。SYNC_CONCURRENCYで調整可。
   const concurrency = Math.max(1, Number(process.env.SYNC_CONCURRENCY ?? 4));
+  // 観測メンバーを channel_members へ記録（歴・観測日時はGREATESTで更新）。
+  // last_seen_at には配信の公開日時を渡す（30日窓＝直近30日の配信で観測、の意味）。
+  // published_atが無い（member-backfill）ときは窓の意味が壊れるのでスキップする。
+  const writeMembers = async (row, members) => {
+    if (!members || members.length === 0 || !row.published_at) return;
+    const rows = members.map(([m, t]) => ({
+      c: row.channel_id,
+      m,
+      t,
+      s: row.published_at,
+    }));
+    const { error } = await db.rpc("record_channel_members", { p_rows: rows });
+    if (!error) membersWritten += rows.length;
+  };
+
   await mapPool(targets, concurrency, async (row) => {
     if (Date.now() - t0 > budgetMs) return;
     stats.attempted++;
     const result = await processItem(row.video_id);
-    if (!result) return; // 一過性失敗・途中中断。翌日リトライ（行を書かない）
+    if (!result) return; // 一過性失敗。次回リトライ（行を書かない）
+    if (result.partial) {
+      // 途中で落ちた配信。メンバーだけ記録し、video_superchats は書かない
+      // ＝ already に入らないので、次回もう一度フルで取りに行く。
+      await writeMembers(row, result.members);
+      return;
+    }
     if (result.empty) {
       // 公開が新しい配信はリプレイ未生成の可能性があるので0確定を保留（翌日リトライ）。
       // published_atが不明（backfillターゲット）なら確定してよい。
@@ -415,21 +451,7 @@ async function main() {
       .upsert(patch, { onConflict: "video_id" });
     if (!upErr) written++;
 
-    // 観測メンバーを channel_members へ記録（歴・観測日時はGREATESTで更新）。
-    // last_seen_at には配信の公開日時を渡す（30日窓＝直近30日の配信で観測、の意味）。
-    // published_atが無い（member-backfill）ときは窓の意味が壊れるのでスキップする。
-    if (!result.empty && result.members.length > 0 && row.published_at) {
-      const rows = result.members.map(([m, t]) => ({
-        c: row.channel_id,
-        m,
-        t,
-        s: row.published_at,
-      }));
-      const { error: mErr } = await db.rpc("record_channel_members", {
-        p_rows: rows,
-      });
-      if (!mErr) membersWritten += rows.length;
-    }
+    if (!result.empty) await writeMembers(row, result.members);
 
     // ギフト受贈者を記録する（収益推定で観測メンバーから外すため）。
     // members と同じく published_at を窓の基準に使うので、無いときはスキップ。
