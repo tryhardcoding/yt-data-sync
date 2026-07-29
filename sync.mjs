@@ -423,11 +423,33 @@ async function main() {
     if (!error) membersWritten += rows.length;
   };
 
-  const heartbeat = setInterval(() => {
-    console.log(
-      `[${((Date.now() - t0) / 60000).toFixed(0)}min] attempted=${stats.attempted} wrote=${written} deferred=${deferred} members=${membersWritten} interrupted=${stats.interrupted} retries=${stats.retries}`,
-    );
-  }, 300_000);
+  // ハートビートはログとDBの両方に出す。GitHubは実行中のログをAPIから返さないので、
+  // ログだけだと詰まっている最中に外から様子が分からない（実測 2026-07-29: 書き込みが
+  // 90分止まったが、attempted が進んでいるのかどうかを終了まで確認できなかった）。
+  const beat = async () => {
+    const line = `[${((Date.now() - t0) / 60000).toFixed(0)}min] attempted=${stats.attempted} wrote=${written} deferred=${deferred} members=${membersWritten} interrupted=${stats.interrupted} retries=${stats.retries}`;
+    console.log(line);
+    await db
+      .from("insight_snapshots")
+      .upsert(
+        {
+          id: "chat-sync:heartbeat",
+          captured_at: new Date().toISOString(),
+          payload: {
+            elapsedMin: Number(((Date.now() - t0) / 60000).toFixed(1)),
+            written,
+            empties,
+            deferred,
+            membersWritten,
+            targets: targets.length,
+            ...stats,
+          },
+        },
+        { onConflict: "id" },
+      )
+      .then(() => {}, () => {});
+  };
+  const heartbeat = setInterval(beat, 120_000);
   heartbeat.unref?.();
 
   await mapPool(targets, concurrency, async (row) => {
