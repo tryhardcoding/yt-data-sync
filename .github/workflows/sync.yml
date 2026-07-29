@@ -19,9 +19,17 @@ on:
           - normal
           - gift
           - member
+      budget_min:
+        description: "実行予算(分)。短く回して stats だけ見たいときに下げる"
+        default: "300"
+      chat_retries:
+        description: "チャットページのリトライ回数。絞られているか切り分けるときに下げる"
+        default: "8"
 
 concurrency:
-  group: sync
+  # 手動実行は定期実行と別枠にする。定期実行が5時間走っている最中でも、
+  # 短い診断用の実行を割り込ませて stats を見られるようにするため。
+  group: sync-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -41,3 +49,5 @@ jobs:
           SYNC_WINDOW_DAYS: ${{ github.event.inputs.window_days || '30' }}
           GIFT_BACKFILL: ${{ github.event.inputs.mode == 'gift' && '1' || '0' }}
           MEMBER_BACKFILL: ${{ github.event.inputs.mode == 'member' && '1' || '0' }}
+          SYNC_BUDGET_MIN: ${{ github.event.inputs.budget_min || '300' }}
+          SYNC_CHAT_RETRIES: ${{ github.event.inputs.chat_retries || '8' }}
