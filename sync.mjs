@@ -85,6 +85,11 @@ const BACKOFF_CAP_MS = 20_000;
 // in_progress。同時刻に別枠で回した診断ジョブは retries 0 で正常だった）。
 // ハングを一過性エラーに落として、バックオフ再試行に載せる。
 const REQUEST_TIMEOUT_MS = Number(process.env.SYNC_REQUEST_TIMEOUT_MS ?? 30_000);
+// 429を食らったら全ワーカーを揃って休ませる。個々のリトライだけだと、絞られている
+// 最中に4本が別々に叩き続けて回復を遅らせるうえ、予算を空回りで溶かす
+// （実測 2026-07-29: 50分で attempted 1581 のうち 1421 が429、書き込みは119で頭打ち）。
+const COOLDOWN_MS = Number(process.env.SYNC_COOLDOWN_MS ?? 60_000);
+let cooldownUntil = 0;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -93,8 +98,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 実行毎に出して、並列や頻度を上げてよいかを実測で決められるようにする。
 const stats = {
   attempted: 0, // 実際に着手した配信
-  watchFail: 0, // watchページが取れない（一過性扱い）
-  botWall: 0, // INNERTUBE_API_KEYが無い＝同意/ボット判定の壁
+  nextFail: 0, // nextエンドポイントが取れない（一過性扱い）
+  botWall: 0, // 応答が壊れている＝同意/ボット判定の壁
+  cooldowns: 0, // 429で全体を止めた回数
   interrupted: 0, // チャットのページ送り中に落ちた（部分集計なので破棄）
   retries: 0, // バックオフ再試行の回数
   give429: 0, // 再試行を使い切った内訳
@@ -108,6 +114,9 @@ const stats = {
 // 429/5xx/ネットワーク失敗を指数バックオフ+ジッタで再試行する。恒久エラー（404等）や
 // リトライ尽きはそのままresを返し（nullもあり得る）、呼び出し側で一過性扱いを判断する。
 async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
+  // 誰かが429を踏んでいる間は全員待つ
+  const wait = cooldownUntil - Date.now();
+  if (wait > 0) await sleep(wait);
   let delay = FETCH_BACKOFF_MS;
   for (let i = 0; i < tries; i++) {
     let res = null;
@@ -129,7 +138,11 @@ async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
       delay = Math.min(delay * 2, BACKOFF_CAP_MS);
       continue;
     }
-    if (status === 429) stats.give429++;
+    if (status === 429) {
+      stats.give429++;
+      if (Date.now() >= cooldownUntil) stats.cooldowns++;
+      cooldownUntil = Math.max(cooldownUntil, Date.now() + COOLDOWN_MS);
+    }
     else if (status >= 500) stats.give5xx++;
     else if (status === 0) stats.giveNet++;
     else stats.giveOther++;
@@ -138,31 +151,49 @@ async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
   return null;
 }
 
-async function processItem(itemId) {
-  const page = await fetchRetry(`https://www.youtube.com/watch?v=${itemId}`, {
-    headers: { "user-agent": UA, "accept-language": "ja" },
-  });
-  // ページ取得の一過性失敗は翌日リトライ（null）。
-  if (!page || !page.ok) {
-    stats.watchFail++;
+// nextの応答からチャットリプレイの開始continuationを探す。
+function findChatContinuation(obj, depth = 0) {
+  if (!obj || typeof obj !== "object" || depth > 8) return null;
+  const c = obj.liveChatRenderer?.continuations?.[0]?.reloadContinuationData?.continuation;
+  if (c) return c;
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === "object") {
+      const hit = findChatContinuation(v, depth + 1);
+      if (hit) return hit;
+    }
+  }
+  return null;
+}
+
+async function processItem(itemId, key) {
+  // watchページのHTML(1本1MB超)は取らない。InnerTubeのnextで同じ情報が取れる。
+  // 実測(2026-07-29): 5本すべてで watch と判定が一致し、応答は約1/3のサイズ。
+  // 決定的なのは 429 が watchページにだけ来ていたこと（give429とwatchFailが同数で、
+  // youtubei系のチャット取得は1件も失敗していなかった）。
+  const res = await fetchRetry(
+    `https://www.youtube.com/youtubei/v1/next?key=${key}&prettyPrint=false`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", "user-agent": UA },
+      body: JSON.stringify({ context: { client: CLIENT }, videoId: itemId }),
+    },
+  );
+  if (!res || !res.ok) {
+    stats.nextFail++;
     return null;
   }
-  const html = await page.text();
-  const key = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
-  const first = html.match(
-    /"liveChatRenderer":\{"continuations":\[\{"reloadContinuationData":\{"continuation":"([^"]+)"/,
-  );
-  // INNERTUBE_API_KEY は正常なwatchページには必ず入っている。無い＝同意/ボット判定の
-  // 壁ページを掴まされた可能性が高いので、0確定せず一過性扱い（null）で翌日リトライに回す
-  // （データセンターIPでこれを0確定すると、実際にはスパチャのある配信を取りこぼす）。
-  if (!key) {
+  let data;
+  try {
+    data = await res.json();
+  } catch {
     stats.botWall++;
     return null;
   }
-  // key はあるがチャット継続が無い＝チャット無効・メンバー限定・リプレイ未生成。
+  // チャット継続が無い＝チャット無効・メンバー限定・リプレイ未生成。
   // 配信直後の生成ラグで一時的にこうなるので、0の確定は main 側で公開経過を見て判断する。
+  const first = findChatContinuation(data);
   if (!first) return { empty: true };
-  let continuation = first[1];
+  let continuation = first;
 
   const breakdown = {};
   let count = 0;
@@ -395,6 +426,19 @@ async function main() {
 
   // 進捗のハートビート。stats は実行終了時にしか出ないので、詰まったときに
   // 外から様子が分からなかった。5分毎に出して、止まっていることを検知できるようにする。
+  // InnerTubeのキーは実行中ずっと使い回せる。1本ごとにwatchページを取っていたのを
+  // ここ1回に減らす（絞られていたのはこの経路）。
+  const home = await fetchRetry("https://www.youtube.com/", {
+    headers: { "user-agent": UA, "accept-language": "ja" },
+  });
+  const apiKey = home && home.ok
+    ? (((await home.text()).match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1] ?? null)
+    : null;
+  if (!apiKey) {
+    console.log("INNERTUBE_API_KEY が取れなかった。次回に持ち越す");
+    return;
+  }
+
   let written = 0;
   let empties = 0;
   let truncated = 0;
@@ -455,7 +499,7 @@ async function main() {
   await mapPool(targets, concurrency, async (row) => {
     if (Date.now() - t0 > budgetMs) return;
     stats.attempted++;
-    const result = await processItem(row.video_id);
+    const result = await processItem(row.video_id, apiKey);
     if (!result) return; // 一過性失敗。次回リトライ（行を書かない）
     if (result.partial) {
       // 途中で落ちた配信。メンバーだけ記録し、video_superchats は書かない
