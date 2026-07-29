@@ -76,6 +76,22 @@ const FETCH_BACKOFF_MS = Number(process.env.SYNC_FETCH_BACKOFF_MS ?? 800);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 失敗の内訳。fetchRetry も mapPool も失敗を握り潰すので、これまでログからは
+// 「YouTubeに絞られて落ちたのか、単に予算切れで手が回らなかったのか」を区別できなかった。
+// 実行毎に出して、並列や頻度を上げてよいかを実測で決められるようにする。
+const stats = {
+  attempted: 0, // 実際に着手した配信
+  watchFail: 0, // watchページが取れない（一過性扱い）
+  botWall: 0, // INNERTUBE_API_KEYが無い＝同意/ボット判定の壁
+  interrupted: 0, // チャットのページ送り中に落ちた（部分集計なので破棄）
+  retries: 0, // バックオフ再試行の回数
+  give429: 0, // 再試行を使い切った内訳
+  give5xx: 0,
+  giveNet: 0,
+  giveOther: 0,
+  thrown: 0, // 予期しない例外
+};
+
 // 429/5xx/ネットワーク失敗を指数バックオフ+ジッタで再試行する。恒久エラー（404等）や
 // リトライ尽きはそのままresを返し（nullもあり得る）、呼び出し側で一過性扱いを判断する。
 async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
@@ -91,10 +107,15 @@ async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
     const status = res ? res.status : 0;
     const retryable = status === 429 || status >= 500 || status === 0;
     if (i < tries - 1 && retryable) {
+      stats.retries++;
       await sleep(delay + Math.floor(Math.random() * 400));
       delay *= 2;
       continue;
     }
+    if (status === 429) stats.give429++;
+    else if (status >= 500) stats.give5xx++;
+    else if (status === 0) stats.giveNet++;
+    else stats.giveOther++;
     return res;
   }
   return null;
@@ -105,7 +126,10 @@ async function processItem(itemId) {
     headers: { "user-agent": UA, "accept-language": "ja" },
   });
   // ページ取得の一過性失敗は翌日リトライ（null）。
-  if (!page || !page.ok) return null;
+  if (!page || !page.ok) {
+    stats.watchFail++;
+    return null;
+  }
   const html = await page.text();
   const key = (html.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
   const first = html.match(
@@ -114,7 +138,10 @@ async function processItem(itemId) {
   // INNERTUBE_API_KEY は正常なwatchページには必ず入っている。無い＝同意/ボット判定の
   // 壁ページを掴まされた可能性が高いので、0確定せず一過性扱い（null）で翌日リトライに回す
   // （データセンターIPでこれを0確定すると、実際にはスパチャのある配信を取りこぼす）。
-  if (!key) return null;
+  if (!key) {
+    stats.botWall++;
+    return null;
+  }
   // key はあるがチャット継続が無い＝チャット無効・メンバー限定・リプレイ未生成。
   // 配信直後の生成ラグで一時的にこうなるので、0の確定は main 側で公開経過を見て判断する。
   if (!first) return { empty: true };
@@ -214,7 +241,10 @@ async function processItem(itemId) {
   }
 
   // 途中中断（429等）は部分集計なので確定させず翌日リトライに回す。
-  if (interrupted) return null;
+  if (interrupted) {
+    stats.interrupted++;
+    return null;
+  }
 
   let total = 0;
   for (const [unit, amt] of Object.entries(breakdown)) {
@@ -238,7 +268,10 @@ async function mapPool(items, concurrency, fn) {
   const workers = Array.from({ length: concurrency }, async () => {
     while (idx < items.length) {
       const my = idx++;
-      await fn(items[my], my).catch(() => null);
+      await fn(items[my], my).catch(() => {
+        stats.thrown++;
+        return null;
+      });
     }
   });
   await Promise.all(workers);
@@ -339,6 +372,7 @@ async function main() {
   const concurrency = Math.max(1, Number(process.env.SYNC_CONCURRENCY ?? 4));
   await mapPool(targets, concurrency, async (row) => {
     if (Date.now() - t0 > budgetMs) return;
+    stats.attempted++;
     const result = await processItem(row.video_id);
     if (!result) return; // 一過性失敗・途中中断。翌日リトライ（行を書かない）
     if (result.empty) {
@@ -403,6 +437,9 @@ async function main() {
   console.log(
     `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}, members ${membersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
+  // 着手したのに書けなかったぶんの内訳。give429が多ければ絞られている＝頻度や並列を
+  // 上げてはいけない。0のままなら詰まりは予算側なので増やしてよい、と読む。
+  console.log(`stats ${JSON.stringify(stats)}`);
 }
 
 main().catch((e) => {

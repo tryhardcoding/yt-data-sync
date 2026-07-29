@@ -2,7 +2,10 @@ name: sync
 
 on:
   schedule:
-    - cron: "0 20 * * *"
+    # 6時間毎。1回300分の予算を使い切って終わるので（実測 300.1min / 243本）、
+    # 回数がそのままスループットになる。publicリポなのでActionsの分課金は無い。
+    # 並列は4のまま＝YouTubeへの瞬間的な負荷は1日1回のときと変わらない。
+    - cron: "0 2,8,14,20 * * *"
   workflow_dispatch:
     inputs:
       window_days:
