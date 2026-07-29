@@ -79,6 +79,12 @@ const FETCH_BACKOFF_MS = Number(process.env.SYNC_FETCH_BACKOFF_MS ?? 800);
 const CHAT_RETRIES = Number(process.env.SYNC_CHAT_RETRIES ?? 8);
 // 指数バックオフの上限。8回×青天井だと1ページで数分待ちうる。
 const BACKOFF_CAP_MS = 20_000;
+// 1リクエストの上限。node の fetch は既定でタイムアウトを持たないので、応答が
+// 返らない接続を掴んだワーカーは永久に待ち続ける。並列4のうち4本が掴めば実行が
+// 丸ごと無音になる（実測 2026-07-29: 定期実行が45分以上、書き込みゼロのまま
+// in_progress。同時刻に別枠で回した診断ジョブは retries 0 で正常だった）。
+// ハングを一過性エラーに落として、バックオフ再試行に載せる。
+const REQUEST_TIMEOUT_MS = Number(process.env.SYNC_REQUEST_TIMEOUT_MS ?? 30_000);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -106,8 +112,12 @@ async function fetchRetry(url, opts, tries = FETCH_RETRIES) {
   for (let i = 0; i < tries; i++) {
     let res = null;
     try {
-      res = await fetch(url, opts);
+      res = await fetch(url, {
+        ...opts,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
     } catch {
+      // タイムアウト・接続断はどちらもここに来る。status 0 扱いで再試行に載せる
       res = null;
     }
     if (res && res.ok) return res;
@@ -383,6 +393,8 @@ async function main() {
   // リプレイ生成ラグの猶予: 公開からこの時間を過ぎてもチャットが無ければ恒久的とみなす。
   const EMPTY_CONFIRM_MS = 48 * 3600_000;
 
+  // 進捗のハートビート。stats は実行終了時にしか出ないので、詰まったときに
+  // 外から様子が分からなかった。5分毎に出して、止まっていることを検知できるようにする。
   let written = 0;
   let empties = 0;
   let truncated = 0;
@@ -410,6 +422,13 @@ async function main() {
     const { error } = await db.rpc("record_channel_members", { p_rows: rows });
     if (!error) membersWritten += rows.length;
   };
+
+  const heartbeat = setInterval(() => {
+    console.log(
+      `[${((Date.now() - t0) / 60000).toFixed(0)}min] attempted=${stats.attempted} wrote=${written} deferred=${deferred} members=${membersWritten} interrupted=${stats.interrupted} retries=${stats.retries}`,
+    );
+  }, 300_000);
+  heartbeat.unref?.();
 
   await mapPool(targets, concurrency, async (row) => {
     if (Date.now() - t0 > budgetMs) return;
@@ -467,6 +486,7 @@ async function main() {
       if (!gErr) giftsWritten += rows.length;
     }
   });
+  clearInterval(heartbeat);
   console.log(
     `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}, members ${membersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
