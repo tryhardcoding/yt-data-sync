@@ -322,8 +322,19 @@ async function main() {
     console.log(`gift backfill targets: ${targets.length}`);
   } else {
     // 対象の全アーカイブ（窓内）を1000行上限を跨いで全件取得（上限なし）。
-    // スパチャは同接の多い配信にほぼ限られるため peak_concurrent降順で優先処理する
-    // （価値ある配信のカバーを前倒しし、末尾の0円配信は後回しでも埋まる）。
+    //
+    // 公開が新しい順に処理する。以前は peak_concurrent降順だったが、これは
+    // 「1本あたりのコストが最も高い配信から順に処理する」という意味になっていた。
+    // 実測（2026-07-29）:
+    //   同接未観測(null)     2〜22ページ / 1.2〜7.1秒
+    //   同接50〜500          2〜8ページ / 1.2〜3.0秒
+    //   同接13万             1500ページ（上限）/ 362秒
+    // 巨大配信は小規模配信の100倍以上かかるため、300分の予算がそこで溶けて
+    // 1日243本しか進まず、新規発生（2,554本/日）に永久に追いつけなかった。
+    // 新しい順なら、その日に終わった配信をその日のうちに拾える。帯別の必要量は
+    // 合計およそ342ワーカー分/日で、いまの枠（4回×300分×並列4＝4,800）の7%に収まる。
+    // 大手を落とすわけではない（新規の大手も同じ日に処理される）。後回しになるのは
+    // 過去の未処理分で、これは余った予算で古い方へ順に消化される。
     const rows = [];
     for (let from = 0; ; from += 1000) {
       const { data, error } = await db
@@ -331,7 +342,7 @@ async function main() {
         .select("video_id, channel_id, published_at, peak_concurrent")
         .eq("live_status", "archive")
         .gte("published_at", since)
-        .order("peak_concurrent", { ascending: false, nullsFirst: false })
+        .order("published_at", { ascending: false })
         .order("video_id")
         .range(from, from + 999);
       if (error) throw error;
