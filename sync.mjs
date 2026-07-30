@@ -393,7 +393,7 @@ async function main() {
     for (let from = 0; ; from += 1000) {
       const { data, error } = await db
         .from("tracked_videos")
-        .select("video_id, channel_id, published_at, peak_concurrent")
+        .select("video_id, channel_id, published_at, peak_concurrent, duration_sec")
         .eq("live_status", "archive")
         .gte("published_at", since)
         .order("published_at", { ascending: false })
@@ -415,9 +415,25 @@ async function main() {
       for (const r of data ?? []) already.add(r.video_id);
       if (!data || data.length < 1000) break;
     }
-    targets = rows.filter((r) => !already.has(r.video_id));
+    // 配信終了（公開+尺）から1時間経っていないものは、リプレイが生成されておらず
+    // 空振り（deferred）になるだけなので今回は見送る。次の実行（6時間後）で拾う。
+    // 実測(2026-07-29): 1時間の実行で attempted 1872 のうち 473 が deferred だった。
+    const READY_LAG_MS = 60 * 60_000;
+    const now = Date.now();
+    let notReady = 0;
+    targets = rows.filter((r) => {
+      if (already.has(r.video_id)) return false;
+      const end = Date.parse(r.published_at ?? "") + (r.duration_sec ?? 0) * 1000;
+      // 日時が壊れている行は落とさず対象に入れる（判断できないものを捨てない）
+      if (!Number.isFinite(end)) return true;
+      if (end + READY_LAG_MS >= now) {
+        notReady++;
+        return false;
+      }
+      return true;
+    });
     console.log(
-      `archives: ${rows.length} / already: ${already.size} / todo: ${targets.length}`,
+      `archives: ${rows.length} / already: ${already.size} / notReady: ${notReady} / todo: ${targets.length}`,
     );
   }
 
@@ -553,6 +569,20 @@ async function main() {
     }
   });
   clearInterval(heartbeat);
+
+  // メンバー観測が増えたら、その場で重なりを作り直す。retention cron（1日1回）任せだと
+  // 反映が最大24時間遅れる。実測5秒で終わる集計なので実行ごとに回してよい。
+  // （このRPCは pg_safeupdate の DELETE 制約で長らく全件失敗していた。2026-07-30に修正済み）
+  if (membersWritten > 0) {
+    const { data: overlapRows, error: ovErr } = await db.rpc(
+      "refresh_channel_audience_overlap",
+      {},
+    );
+    console.log(
+      `overlap refresh: ${ovErr ? `失敗 ${ovErr.message}` : `${overlapRows}行`}`,
+    );
+  }
+
   console.log(
     `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}, members ${membersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
