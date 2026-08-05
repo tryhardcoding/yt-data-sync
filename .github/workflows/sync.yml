@@ -46,6 +46,9 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # 発言者の識別子をハッシュにするpepper。無ければ発言者の観測だけが止まる。
+          # **値を変えないこと**（変えると同じ視聴者が別人として数えられる）。
+          COMMENTER_PEPPER: ${{ secrets.COMMENTER_PEPPER }}
           SYNC_WINDOW_DAYS: ${{ github.event.inputs.window_days || '30' }}
           GIFT_BACKFILL: ${{ github.event.inputs.mode == 'gift' && '1' || '0' }}
           MEMBER_BACKFILL: ${{ github.event.inputs.mode == 'member' && '1' || '0' }}

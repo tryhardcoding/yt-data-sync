@@ -2,6 +2,7 @@
 // for each item, aggregate, and write results back. Paced and concurrent.
 
 import { createClient } from "@supabase/supabase-js";
+import { createHmac } from "node:crypto";
 
 const DB_URL = process.env.SUPABASE_URL;
 const DB_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -10,6 +11,23 @@ if (!DB_URL || !DB_KEY) {
   process.exit(1);
 }
 const db = createClient(DB_URL, DB_KEY);
+
+// 発言者の識別子をハッシュに変えるpepper。**無ければ発言者の観測だけを止める**
+// （収集の本体は動かす）。channel_members 側の member_hash_pepper とは別の値にする——
+// 片方が漏れてももう一方のハッシュと突き合わせられず、2表を相互参照して
+// 再識別を進められない。**一度決めたら変えない**（変えると同じ視聴者が別人になる）。
+const COMMENTER_PEPPER = process.env.COMMENTER_PEPPER ?? null;
+if (!COMMENTER_PEPPER) {
+  console.warn("COMMENTER_PEPPER が無いので発言者の観測はスキップする");
+}
+
+// 生のチャンネルIDは保存しない。8バイト(64bit)は150万人規模で衝突の期待値が1e-7未満。
+function commenterHash(id) {
+  return createHmac("sha256", COMMENTER_PEPPER)
+    .update(id)
+    .digest("hex")
+    .slice(0, 16);
+}
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
@@ -68,6 +86,8 @@ const CLIENT = { clientName: "WEB", clientVersion: "2.20250701.01.00", hl: "ja" 
 // 1配信のページ上限。同接の多い配信ほどチャットが長くページ数も多いので、
 // 高価値配信を過小集計しないよう長め（~30時間相当）にする。到達時はtruncatedで記録。
 const MAX_PAGES = 1500;
+// 発言者を1回のRPCで送る件数。大型配信は数万人になるので割らないとJSONが数MBになる。
+const COMMENTER_CHUNK = 5000;
 const PAGE_PAUSE_MS = 120;
 // 429/5xx/ネットワーク失敗のリトライ回数と初期バックオフ。YouTubeはデータセンター
 // （GitHub Actions）IPからのチャット取得を強く絞るため、握り潰さず指数バックオフで粘る。
@@ -235,6 +255,11 @@ async function processItem(itemId, key) {
   let giftMemberships = 0;
   // メンバーバッジ付きで発言したユニークaccount → 歴(月, 最大)。配信内で重複排除。
   const members = new Map();
+  // バッジの有無に関係なく発言した全アカウント。チャンネル同士の視聴者の重なりを
+  // 出す材料で、メンバーだけだと台帳7,000chのうち1,695ch(24%)しか重なりが作れない
+  // （実測でユニーク発言者はメンバーの約4倍）。IDのままでは持たず、書き込み側で
+  // ハッシュに変える。pepperが無い実行では集めない（メモリを無駄に食わせない）。
+  const authors = COMMENTER_PEPPER ? new Set() : null;
   // ギフトメンバーシップを受け取ったaccount。その月ぶんは贈り主が払っているので、
   // 収益推定では観測メンバーから除外する（membershipYenとgiftYenの二重計上を止める）。
   const giftRecipients = new Set();
@@ -294,6 +319,9 @@ async function processItem(itemId, key) {
         if (aid && tenure !== null) {
           members.set(aid, Math.max(members.get(aid) ?? 0, tenure));
         }
+        // 発言者はバッジの有無を問わず全員。messages++ と同じ3種の renderer だけを
+        // 対象にするので、システム告知（加入・ギフト購入/受贈）は入らない。
+        if (aid && authors) authors.add(aid);
       }
       const paid =
         item.liveChatPaidMessageRenderer || item.liveChatPaidStickerRenderer;
@@ -343,10 +371,17 @@ async function processItem(itemId, key) {
   // 積み上げ＝実測の下限として持っており、途中まででも下限としては正しい。
   // 長い配信ほど途中で落ちやすく、かつメンバー観測の価値が最も高いので、
   // ここを捨てると一番欲しいデータだけが構造的に落ち続ける。
+  // 発言者(authors)も同じ理由で救出する。重なりは「一度でも同じchで発言したか」の
+  // 積み上げなので、途中までの観測でも下限として正しい。
   if (interrupted) {
     stats.interrupted++;
     stats.salvagedMembers += members.size;
-    return { partial: true, members: [...members.entries()], pages };
+    return {
+      partial: true,
+      members: [...members.entries()],
+      authors: authors ? [...authors] : [],
+      pages,
+    };
   }
 
   let total = 0;
@@ -364,6 +399,10 @@ async function processItem(itemId, key) {
     memberJoins,
     giftMemberships,
     members: [...members.entries()], // [accountId, 歴(月)][]
+    // バッジの有無を問わない全発言者。**truncated でも書く**——countChat と同じ
+    // ガードにすると同接13万級が丸ごと落ち、ベン図で一番見たい大手が欠ける。
+    // 発言者の集合は途中までの観測でも嘘にならない（下限になるだけ）。
+    authors: authors ? [...authors] : [], // accountId[]
     giftRecipients: [...giftRecipients], // accountId[]
     pages,
     truncated: pages >= MAX_PAGES, // 上限到達＝集計が途中で切れている可能性
@@ -527,6 +566,7 @@ async function main() {
   let chatWritten = 0;
   let deferred = 0;
   let membersWritten = 0;
+  let commentersWritten = 0;
   let giftsWritten = 0;
   const t0 = Date.now();
   // 実行時間の安全上限（超えたぶんは次回に持ち越す）。手元で短く回して
@@ -550,6 +590,26 @@ async function main() {
     if (!error) membersWritten += rows.length;
   };
 
+  // 発言者を channel_commenters へ記録する（重なりの材料）。writeMembers と同じく
+  // published_at を35日窓の基準に使うので、無いときはスキップする。
+  // **5,000件ずつに割る**——大型配信は数万人になり、1リクエストのJSONが数MBに膨らむ。
+  const writeCommenters = async (row, list) => {
+    if (!COMMENTER_PEPPER || !list || list.length === 0 || !row.published_at)
+      return;
+    for (let i = 0; i < list.length; i += COMMENTER_CHUNK) {
+      const rows = list.slice(i, i + COMMENTER_CHUNK).map((a) => ({
+        c: row.channel_id,
+        h: commenterHash(a),
+        s: row.published_at,
+      }));
+      const { error } = await db.rpc("record_channel_commenters", {
+        p_rows: rows,
+      });
+      if (error) break; // 残りも同じ理由で落ちる。次回の観測で埋め直す
+      commentersWritten += rows.length;
+    }
+  };
+
   // ハートビートはログとDBの両方に出す。GitHubは実行中のログをAPIから返さないので、
   // ログだけだと詰まっている最中に外から様子が分からない（実測 2026-07-29: 書き込みが
   // 90分止まったが、attempted が進んでいるのかどうかを終了まで確認できなかった）。
@@ -568,6 +628,7 @@ async function main() {
             empties,
             deferred,
             membersWritten,
+            commentersWritten,
             targets: targets.length,
             ...stats,
           },
@@ -585,9 +646,10 @@ async function main() {
     const result = await processItem(row.video_id, apiKey);
     if (!result) return; // 一過性失敗。次回リトライ（行を書かない）
     if (result.partial) {
-      // 途中で落ちた配信。メンバーだけ記録し、video_superchats は書かない
+      // 途中で落ちた配信。メンバーと発言者だけ記録し、video_superchats は書かない
       // ＝ already に入らないので、次回もう一度フルで取りに行く。
       await writeMembers(row, result.members);
+      await writeCommenters(row, result.authors);
       return;
     }
     if (result.empty) {
@@ -634,6 +696,7 @@ async function main() {
     if (!upErr) written++;
 
     if (!result.empty) await writeMembers(row, result.members);
+    if (!result.empty) await writeCommenters(row, result.authors);
 
     // ギフト受贈者を記録する（収益推定で観測メンバーから外すため）。
     // members と同じく published_at を窓の基準に使うので、無いときはスキップ。
@@ -664,8 +727,40 @@ async function main() {
     );
   }
 
+  // 発言者ベースの重なり（channel_commenter_overlap）。**1日1回だけ**回す。
+  // メンバー版と違って母集団が約4倍あり自己結合が重いので、6時間ごとの実行すべてで
+  // 回すと収集の時間予算を食う。前回は cron_runs で見る（この関数は cron ではないが、
+  // 「いつ回したか」を残せる既存の枠がここしかない）。
+  if (commentersWritten > 0) {
+    const since = new Date(Date.now() - 20 * 3600_000).toISOString();
+    const { count } = await db
+      .from("cron_runs")
+      .select("id", { count: "exact", head: true })
+      .eq("job", "commenter-overlap")
+      .gte("started_at", since);
+    if ((count ?? 0) === 0) {
+      const t = Date.now();
+      const { data: rows, error: err } = await db.rpc(
+        "refresh_channel_commenter_overlap",
+        {},
+      );
+      console.log(
+        `commenter overlap: ${err ? `失敗 ${err.message}` : `${rows}行`} / ${((Date.now() - t) / 1000).toFixed(1)}s`,
+      );
+      // **失敗しても行を残す。** 残さないと次の実行で必ず再試行して、
+      // 重い自己結合を毎回踏み続ける（収集の予算を食う）。
+      await db.from("cron_runs").insert({
+        job: "commenter-overlap",
+        started_at: new Date(t).toISOString(),
+        duration_ms: Date.now() - t,
+        refreshed: err ? null : rows,
+        error: err ? err.message.slice(0, 500) : null,
+      });
+    }
+  }
+
   console.log(
-    `wrote ${written} (empty ${empties}, truncated ${truncated}, chat ${chatWritten}, deferred ${deferred}, members ${membersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
+    `wrote ${written} (empty ${empties}, truncated ${truncated}, chat ${chatWritten}, deferred ${deferred}, members ${membersWritten}, commenters ${commentersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
   // 着手したのに書けなかったぶんの内訳。give429が多ければ絞られている＝頻度や並列を
   // 上げてはいけない。0のままなら詰まりは予算側なので増やしてよい、と読む。

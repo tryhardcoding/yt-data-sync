@@ -1,1 +1,6 @@
 node_modules/
+# COMMENTER_PEPPER をローカル検証用に置く。**絶対にコミットしない**
+# （本番と同じ値なので、漏れると channel_commenters のハッシュが逆引きできる）
+.env
+.env.*
+.pepper*
