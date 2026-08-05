@@ -165,6 +165,33 @@ function findChatContinuation(obj, depth = 0) {
   return null;
 }
 
+// リプレイの応答から「チャットのリプレイ（全部）」のcontinuationを探す。
+//
+// **既定のトークンは「上位のチャットのリプレイ」で、フィルタが掛かっている。**
+// viewSelector の subtitle がそのまま「一部のメッセージ（不適切な可能性があるものなど）を
+// 非表示にします」／「すべてのメッセージが表示されます」と書いてある。
+// 実測(2026-08-05・同じ配信を両方で全走査):
+//   Oc4YpbUXZWE  上位 1,016 / 全部 1,016  (100.0%)
+//   _ZFrTbvKJFA  上位 3,294 / 全部 3,424  ( 96.2%)
+// スパチャは両方で完全一致（17/17・29/29）＝有料は落ちない。ページ数・所要も同じなので、
+// 増えるのはこの1リクエストだけ。総コメント数を名乗る以上フィルタ前を数える。
+//
+// トークンは**URLエンコードされている**（末尾が `%3D%3D`）。デコードせずに投げると400。
+function findAllChatContinuation(cc) {
+  const items =
+    cc?.header?.liveChatHeaderRenderer?.viewSelector?.sortFilterSubMenuRenderer
+      ?.subMenuItems;
+  if (!Array.isArray(items)) return null;
+  const all = items.find((it) => it && it.selected !== true);
+  const raw = all?.continuation?.reloadContinuationData?.continuation;
+  if (!raw) return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+}
+
 async function processItem(itemId, key) {
   // watchページのHTML(1本1MB超)は取らない。InnerTubeのnextで同じ情報が取れる。
   // 実測(2026-07-29): 5本すべてで watch と判定が一致し、応答は約1/3のサイズ。
@@ -197,6 +224,13 @@ async function processItem(itemId, key) {
 
   const breakdown = {};
   let count = 0;
+  // 発言の総数（通常コメント＋スパチャ＋ステッカー）。システム告知（ギフト購入・受贈・
+  // 加入）は「発言」ではないので数えない。
+  let messages = 0;
+  // 1ページ目で乗り換えを試したか / 実際に「全部」のトークンに乗れたか
+  // （findAllChatContinuation 参照）。
+  let probedFilter = false;
+  let usingAllChat = false;
   let memberJoins = 0;
   let giftMemberships = 0;
   // メンバーバッジ付きで発言したユニークaccount → 歴(月, 最大)。配信内で重複排除。
@@ -228,6 +262,20 @@ async function processItem(itemId, key) {
       interrupted = true; // 応答異常。同上
       break;
     }
+    // 1ページ目だけ「チャットのリプレイ（全部）」へ乗り換える。既定は「上位のチャット」で
+    // フィルタが掛かっており、実測で最大3.8%のコメントが落ちていた。乗り換え先のトークンは
+    // このページの header にしか入っていないので、1リクエストは必ず先に要る。
+    // このページ自身はフィルタ済みなので数えずに捨てる（pages も進めない）。
+    if (!probedFilter) {
+      probedFilter = true;
+      const allCont = findAllChatContinuation(cont);
+      if (allCont && allCont !== continuation) {
+        usingAllChat = true;
+        continuation = allCont;
+        continue;
+      }
+      // 見つからなければ既定のまま続行する（UIの構造が変わっても収集は止めない）
+    }
     pages++;
     for (const a of cont.actions ?? []) {
       const item =
@@ -240,6 +288,7 @@ async function processItem(itemId, key) {
         item.liveChatPaidMessageRenderer ||
         item.liveChatPaidStickerRenderer;
       if (msg) {
+        messages++;
         const aid = msg.authorExternalChannelId;
         const tenure = memberTenure(msg.authorBadges);
         if (aid && tenure !== null) {
@@ -307,6 +356,10 @@ async function processItem(itemId, key) {
   return {
     total: Math.round(total),
     count,
+    messages,
+    // 全チャットへ乗り換えられなかった回（UI構造の変化）は上位チャット基準の
+    // 過小値なので、書き込み側で捨てる
+    allChat: usingAllChat,
     breakdown,
     memberJoins,
     giftMemberships,
@@ -339,7 +392,18 @@ async function main() {
   // （列追加後の一度きり。全件は3.5万本で長すぎるため、価値ある行に限定）。
   // このモードでは全アーカイブ/already の取得は不要なので早期に組み立てて抜ける。
   let targets;
-  if (process.env.MEMBER_BACKFILL === "1") {
+  if (process.env.SYNC_VIDEO_IDS) {
+    // SYNC_VIDEO_IDS=id1,id2: 名指しの数本だけ処理する（手元での検証用）。
+    // already を無視して**上書きする**ので、集計の作り方を変えたときに同じ配信の
+    // 前後を比べられる。cronからは渡さない。
+    const ids = process.env.SYNC_VIDEO_IDS.split(",").map((s) => s.trim()).filter(Boolean);
+    const { data } = await db
+      .from("tracked_videos")
+      .select("video_id, channel_id, published_at, duration_sec")
+      .in("video_id", ids);
+    targets = data ?? [];
+    console.log(`named targets: ${targets.length} / ${ids.length}`);
+  } else if (process.env.MEMBER_BACKFILL === "1") {
     const need = [];
     for (let from = 0; ; from += 1000) {
       const { data } = await db
@@ -458,6 +522,9 @@ async function main() {
   let written = 0;
   let empties = 0;
   let truncated = 0;
+  // コメント数を書けた本数。0のまま推移していたら全チャットへの乗り換えが
+  // 壊れている（YouTubeのUI構造が変わった）と読む。
+  let chatWritten = 0;
   let deferred = 0;
   let membersWritten = 0;
   let giftsWritten = 0;
@@ -534,6 +601,8 @@ async function main() {
       empties++;
     }
     if (result.truncated) truncated++;
+    const countChat = !result.empty && !result.truncated && result.allChat;
+    if (countChat) chatWritten++;
     // emptyは0で確定記録し、already入りさせて恒久リトライを止める
     const patch = {
       video_id: row.video_id,
@@ -542,6 +611,18 @@ async function main() {
       superchat_count: result.empty ? 0 : result.count,
       currency_breakdown: result.empty ? {} : result.breakdown,
       member_joins: result.empty ? 0 : result.memberJoins,
+      // コメント数は**確信が持てた回だけ**書く。null＝未収集 / 0＝実測して0件。
+      //   empty      … チャット無効・メン限・リプレイ未生成。0件かどうか分からない
+      //   truncated  … MAX_PAGES到達。下限値でしかない（実測0.05%だが同接13万級に偏る＝
+      //                ランキング上位に出るので、下限を混ぜるより欠けさせる）
+      //   !allChat   … 「上位のチャット」のままだった回。フィルタ済みで最大3.8%欠ける
+      ...(countChat
+        ? {
+            chat_messages: result.messages,
+            // 毎分コメント数の分母。尺を持たないターゲット（member-backfill）では書かない
+            chat_duration_sec: row.duration_sec ?? null,
+          }
+        : {}),
       gift_memberships: result.empty ? 0 : result.giftMemberships,
       harvested_at: new Date().toISOString(),
     };
@@ -584,7 +665,7 @@ async function main() {
   }
 
   console.log(
-    `wrote ${written} (empty ${empties}, truncated ${truncated}, deferred ${deferred}, members ${membersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
+    `wrote ${written} (empty ${empties}, truncated ${truncated}, chat ${chatWritten}, deferred ${deferred}, members ${membersWritten}, gifted ${giftsWritten}) / ${((Date.now() - t0) / 60000).toFixed(1)}min`,
   );
   // 着手したのに書けなかったぶんの内訳。give429が多ければ絞られている＝頻度や並列を
   // 上げてはいけない。0のままなら詰まりは予算側なので増やしてよい、と読む。
